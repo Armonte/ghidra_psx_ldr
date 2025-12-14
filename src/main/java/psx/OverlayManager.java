@@ -44,6 +44,8 @@ import javax.swing.JComboBox;
 import javax.swing.ButtonGroup;
 
 public class OverlayManager extends JPanel {
+	
+	private static final long serialVersionUID = 1L;
 
 	private final JLabel lblBlockName;
 	private final JTextField blockName;

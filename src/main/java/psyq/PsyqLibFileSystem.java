@@ -64,7 +64,6 @@ public class PsyqLibFileSystem implements GFileSystem {
 	 */
 	public void mount(TaskMonitor monitor) {
 		monitor.setMessage("Opening " + PsyqLibFileSystem.class.getSimpleName() + "...");
-		monitor.clearCanceled();
 		
 		BinaryReader reader = new BinaryReader(provider, true);
 

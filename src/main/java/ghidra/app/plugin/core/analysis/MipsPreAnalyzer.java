@@ -203,8 +203,6 @@ public class MipsPreAnalyzer extends AbstractAnalyzer {
 	 */
 	private void findPair(Program program, AddressSet pairSet, Instruction start_inst,
 			TaskMonitor monitor) {
-		Address minPairAddr = start_inst.getMinAddress();
-
 		BigInteger curvalue = program.getProgramContext().getValue(pairBitRegister,
 			start_inst.getMinAddress(), false);
 		boolean inPairBit = false;

@@ -155,10 +155,18 @@ public class PsxLoader extends AbstractLibrarySupportLoader {
 	private static final long GPBASE_ADDR = DEF_RAM_BASE + 0x1000;
 	
 	private static final String OPTION_NAME = "RAM Base Address: ";
+	private static final String SYSTEM12_OPTION_NAME = "System 12 Mode (Namco System 12)";
 	private long ramBase = DEF_RAM_BASE;
+	private boolean system12Mode = false;
 	
 	public static final String PSX_LANG_ID = "PSX:LE:32:default";
 	public static final String PSX_LANG_SPEC_ID = "default";
+	
+	// System 12 memory map constants
+	private static final long SYSTEM12_BANK_REGISTER = 0x1F000000L;
+	private static final long SYSTEM12_BANKED_ROM_WINDOW_START = 0x1FA00000L;
+	private static final long SYSTEM12_BANKED_ROM_WINDOW_SIZE = 0x200000L; // 2MB window
+	private static final long SYSTEM12_DMA_OFFSET_REGISTER = 0x1F700000L;
 
 	@Override
 	public String getName() {
@@ -175,6 +183,35 @@ public class PsxLoader extends AbstractLibrarySupportLoader {
 		
 		if (psxExe.isParsed()) {
 			loadSpecs.add(new LoadSpec(this, 0, new LanguageCompilerSpecPair(PSX_LANG_ID, "default"), true));
+		} else {
+			// Check if it looks like raw PSX code (MIPS instructions starting at offset 0)
+			// This allows loading raw ROMs without PSX EXE header
+			if (provider.length() >= 4) {
+				// Check for MIPS instruction patterns common in PSX code
+				// lui instruction: 0x3C pattern (upper 8 bits)
+				byte[] header = provider.readBytes(0, 4);
+				
+				// MIPS instructions often start with 0x3C (lui) in first byte
+				// Also check for common PSX entry points (0x80000000+ addresses)
+				boolean looksLikeMips = (header[3] == 0x3C) || 
+				                        (header[2] == 0x3C) ||
+				                        (header[1] == 0x3C) ||
+				                        (header[0] == 0x3C);
+				
+				// Also check for "Sony Computer Entertainment" string (common in PSX ROMs)
+				if (!looksLikeMips && provider.length() >= 0x110) {
+					byte[] sonyStr = provider.readBytes(0x100, 27);
+					String checkStr = new String(sonyStr, 0, 27);
+					if (checkStr.contains("Sony Computer Entertainment")) {
+						looksLikeMips = true;
+					}
+				}
+				
+				if (looksLikeMips) {
+					// Create a synthetic PSX EXE for raw ROMs
+					loadSpecs.add(new LoadSpec(this, 0, new LanguageCompilerSpecPair(PSX_LANG_ID, "default"), false));
+				}
+			}
 		}
 
 		return loadSpecs;
@@ -187,6 +224,7 @@ public class PsxLoader extends AbstractLibrarySupportLoader {
 		List<Option> list = new ArrayList<>();
 		
 		list.add(new PsxBaseChooser(OPTION_NAME, ramBase, PsxBaseChooser.class, Loader.COMMAND_LINE_ARG_PREFIX + "-ramStart"));
+		list.add(new System12Option(SYSTEM12_OPTION_NAME, system12Mode, Boolean.class, Loader.COMMAND_LINE_ARG_PREFIX + "-system12"));
 		
 		return list;
 	}
@@ -197,7 +235,13 @@ public class PsxLoader extends AbstractLibrarySupportLoader {
 			String optName = option.getName();
 			if (optName.equals(OPTION_NAME)) {
 				ramBase = Long.decode((String)option.getValue());
-				break;
+			} else if (optName.equals(SYSTEM12_OPTION_NAME)) {
+				Object value = option.getValue();
+				if (value instanceof Boolean) {
+					system12Mode = (Boolean)value;
+				} else if (value instanceof String) {
+					system12Mode = Boolean.parseBoolean((String)value);
+				}
 			}
 		}
 
@@ -208,12 +252,189 @@ public class PsxLoader extends AbstractLibrarySupportLoader {
 	protected void load(ByteProvider provider, LoadSpec loadSpec, List<Option> options, Program program, TaskMonitor monitor, MessageLog log)
 			throws IOException {
 		
+		// Parse options to ensure system12Mode and ramBase are set before use
+		for (Option option : options) {
+			String optName = option.getName();
+			if (optName.equals(OPTION_NAME)) {
+				ramBase = Long.decode((String)option.getValue());
+			} else if (optName.equals(SYSTEM12_OPTION_NAME)) {
+				Object value = option.getValue();
+				if (value instanceof Boolean) {
+					system12Mode = (Boolean)value;
+				} else if (value instanceof String) {
+					system12Mode = Boolean.parseBoolean((String)value);
+				}
+			}
+		}
+		
 		Options aOpts = program.getOptions(Program.ANALYSIS_PROPERTIES);
 		aOpts.setBoolean("Non-Returning Functions - Discovered", false);
-
-		if (!psxExe.isParsed()) {
-			monitor.setMessage(String.format("%s : Cannot load", getName()));
-			return;
+		
+		// Ensure Function Start Search analyzer is enabled
+		// This analyzer finds function entry points by looking for common patterns
+		// It's critical for finding functions that might be incorrectly marked as data
+		try {
+			aOpts.setBoolean("Function Start Search", true);
+			log.appendMsg("Enabled Function Start Search analyzer");
+		} catch (IllegalArgumentException e) {
+			// Try alternative name (varies by Ghidra version)
+			try {
+				aOpts.setBoolean("Function Start Analyzer", true);
+				log.appendMsg("Enabled Function Start Analyzer");
+			} catch (IllegalArgumentException e2) {
+				// Try another variant
+				try {
+					aOpts.setBoolean("Function Start", true);
+				} catch (IllegalArgumentException e3) {
+					log.appendMsg("Warning: Could not enable Function Start Search - functions may be missed");
+					log.appendMsg("Recommendation: Manually enable 'Function Start Search' in Analysis Options");
+				}
+			}
+		}
+		
+		// Disable following computed references to prevent analysis from chasing invalid addresses
+		// (e.g., corrupted jump table entries like 0x94420000 that cause timeouts)
+		// Standard PSX EXEs don't need this because they have proper headers/metadata
+		// that prevent invalid references, but raw ROMs may contain corrupted data
+		try {
+			aOpts.setBoolean("Reference - Follow computed references", false);
+		} catch (IllegalArgumentException e) {
+			// Option name might vary by Ghidra version, try alternatives
+			try {
+				aOpts.setBoolean("Reference: Follow computed references", false);
+			} catch (IllegalArgumentException e2) {
+				log.appendMsg("Warning: Could not disable computed reference following - analysis may be slow");
+			}
+		}
+		
+		// Configure decompiler to be more conservative about memory reads
+		// This reduces "Unable to read bytes" warnings from invalid addresses  
+		// Note: These options may not exist in all Ghidra versions, so wrapped in try-catch
+		try {
+			Options decompOpts = program.getOptions("Decompiler");
+			// Disable aggressive memory reading during decompilation
+			try {
+				decompOpts.setBoolean("Aggressively Handle Indirect Jumps", false);
+			} catch (Exception e) {
+				// Option name may vary
+			}
+			try {
+				decompOpts.setBoolean("Eliminate Unreachable Code", false);
+			} catch (Exception e) {
+				// Option name may vary
+			}
+			// Try to disable following invalid memory accesses
+			try {
+				decompOpts.setBoolean("Ignore Invalid Memory References", true);
+			} catch (Exception e) {
+				// Option name may vary, try alternatives
+				try {
+					decompOpts.setBoolean("Skip Invalid Memory Accesses", true);
+				} catch (Exception e2) {
+					// May not exist in this Ghidra version
+				}
+			}
+		} catch (Exception e) {
+			// Decompiler options might not be available, ignore
+		}
+		
+		// If not a proper PSX EXE, try to create a synthetic one for raw ROMs
+		if (psxExe == null || !psxExe.isParsed()) {
+			// Try to detect entry point from common patterns
+			BinaryReader reader = new BinaryReader(provider, true);
+			long fileSize = provider.length();
+			
+			// Default values for raw ROM
+			long defaultInitPc = ramBase;
+			long defaultInitGp = ramBase + 0x1000;
+			long defaultRomStart = ramBase;
+			// For System 12, ROMs can be larger than standard PSX RAM_SIZE (2MB)
+			// Allow up to 8MB for System 12 games (can be increased if needed)
+			long maxRomSize = system12Mode ? 0x800000L : RAM_SIZE; // 8MB for System 12, 2MB for standard PSX
+			long defaultRomSize = Math.min(fileSize, maxRomSize);
+			
+			// Try to find entry point in first 0x800 bytes
+			for (long off = 0; off < Math.min(0x800, fileSize - 4); off += 4) {
+				try {
+					long val = reader.readUnsignedInt(off);
+					// Check if it looks like a jal instruction (0x0C) to common entry points
+					if ((val & 0xFC000000) == 0x0C000000) {
+						// jal instruction found, use this as potential entry
+						if (off == 0 || off < 0x100) {
+							defaultInitPc = ramBase + off;
+							break;
+						}
+					}
+				} catch (Exception e) {
+					break;
+				}
+			}
+			
+			// Create synthetic PsxExe data
+			psxExe = new PsxExe(defaultInitPc, defaultInitGp, defaultRomStart, defaultRomSize);
+			log.appendMsg("Raw ROM detected - using synthetic PSX EXE header");
+			log.appendMsg(String.format("Entry point: 0x%08X, ROM start: 0x%08X, ROM size: 0x%X", 
+				defaultInitPc, defaultRomStart, defaultRomSize));
+		}
+		
+		// Configure decompiler analyzer for raw ROMs with aggressive timeout to prevent hangs
+		// Raw ROMs often have invalid addresses - use short timeout so decompiler gives up quickly
+		// and moves on instead of hanging forever
+		// Do this AFTER psxExe is initialized so we can check isParsed() safely
+		if (psxExe != null && !psxExe.isParsed()) {
+			try {
+				// Try to configure decompiler analyzer with timeout
+				// Note: Ghidra analyzer options vary by version, so we try multiple approaches
+				String[] decompilerAnalyzerNames = {
+					"Decompiler Parameter ID",
+					"Decompiler Parameter ID (Decompile)",
+					"Decompiler",
+					"Decompiler Parameter"
+				};
+				
+				boolean configured = false;
+				for (String analyzerName : decompilerAnalyzerNames) {
+					try {
+						// Enable the analyzer (it should be enabled by default)
+						aOpts.setBoolean(analyzerName, true);
+						
+						// Try to set a short timeout to prevent hangs (5 seconds max per function)
+						// This makes decompiler give up quickly on problematic functions
+						try {
+							// Some versions use "Timeout" as a property
+							Options analyzerSpecific = program.getOptions(analyzerName);
+							analyzerSpecific.setInt("Timeout", 5); // 5 second timeout
+							log.appendMsg("Configured decompiler analyzer with 5s timeout for raw ROM");
+							configured = true;
+							break;
+						} catch (Exception e1) {
+							// Timeout option might not exist, that's okay
+						}
+						
+						// Alternative: Try setting through decompiler options directly
+						try {
+							Options decompOpts = program.getOptions("Decompiler");
+							decompOpts.setInt("Timeout", 5);
+							log.appendMsg("Configured decompiler with 5s timeout for raw ROM");
+							configured = true;
+							break;
+						} catch (Exception e2) {
+							// Not available in this version
+						}
+						
+					} catch (IllegalArgumentException e) {
+						// Try next analyzer name
+						continue;
+					}
+				}
+				
+				if (!configured) {
+					log.appendMsg("Warning: Could not configure decompiler timeout - analysis may hang on problematic functions");
+					log.appendMsg("Recommendation: Manually set 'Decompiler Parameter ID' timeout to 5s in Analysis Options");
+				}
+			} catch (Exception e) {
+				log.appendMsg("Warning: Exception configuring decompiler: " + e.getMessage());
+			}
 		}
 		
 		monitor.setMessage("Loading PSX binary...");
@@ -300,16 +521,26 @@ public class PsxLoader extends AbstractLibrarySupportLoader {
 		addPsyqVerOption(program, ramBase, log);
 		setGpBase(program, psxExe.getInitGp());
 		
+		// Set GP register value for all segments (skip invalid/empty ranges)
 		for (final AddressRange range : segments) {
-			setRegisterValue(program, "gp", range.getMinAddress(), range.getMaxAddress(), psxExe.getInitGp(), log);
+			if (range != null && range.getLength() > 0 && range.getMinAddress().compareTo(range.getMaxAddress()) <= 0) {
+				setRegisterValue(program, "gp", range.getMinAddress(), range.getMaxAddress(), psxExe.getInitGp(), log);
+			}
 		}
 		
 		Address romStart = fpa.toAddr(psxExe.getRomStart());
 		Address romEnd = fpa.toAddr(psxExe.getRomEnd());
 		Reference mainRef = findAndAppyMain(provider, fpa, romStart, log);
 		
+		// Only create compiler segments if main() was found (PSX executables with proper headers)
+		// Raw ROMs may not have the expected compiler structure
 		if (mainRef != null) {
-			createCompilerSegments(provider, fpa, romStart, romEnd, initPc, mainRef, log);
+			try {
+				createCompilerSegments(provider, fpa, romStart, romEnd, initPc, mainRef, log);
+			} catch (Exception e) {
+				log.appendMsg("Could not create compiler segments (raw ROM or non-standard structure): " + e.getMessage());
+				log.appendException(e);
+			}
 		}
 		
 		monitor.setMessage("Loading PSX binary done.");
@@ -551,7 +782,23 @@ public class PsxLoader extends AbstractLibrarySupportLoader {
 		
 		Address mainAddr = jalMainRefs[0].getToAddress();
 		try {
+			// Create label for main
 			st.createLabel(mainAddr, "main", SourceType.USER_DEFINED);
+			
+			// Also create the function if it doesn't exist
+			if (listing.getInstructionAt(mainAddr) == null) {
+				disasmInstruction(program, mainAddr);
+			}
+			// Check if function already exists
+			Function existingFunc = listing.getFunctionAt(mainAddr);
+			if (existingFunc == null) {
+				CreateFunctionCmd cmd = new CreateFunctionCmd("main", mainAddr, null, SourceType.USER_DEFINED);
+				if (!cmd.applyTo(program, TaskMonitor.DUMMY)) {
+					log.appendMsg("Warning: Could not create function at main address " + mainAddr);
+				} else {
+					log.appendMsg("Created main function at " + mainAddr);
+				}
+			}
 		} catch (InvalidInputException e) {
 			log.appendException(e);
 			return null;
@@ -570,15 +817,18 @@ public class PsxLoader extends AbstractLibrarySupportLoader {
 		
 		// Games that link NOHEAP.OBJ will not have the jal/addiu instruction pair that calls the InitHeap function.
 		Instruction initHeapDelaySlot = listing.getInstructionAt(mainRefAddr.add(initHeap_delay_off));
-		long noheapAdjustment = initHeapDelaySlot.isInDelaySlot() ? 0 : 8;
+		// Default to 8 if instruction is not found (raw ROMs may not have this pattern)
+		long noheapAdjustment = (initHeapDelaySlot != null && initHeapDelaySlot.isInDelaySlot()) ? 0 : 8;
 		
 		Instruction heapBaseInstr_1 = listing.getInstructionAt(mainRefAddr.add(__heapbase_off + noheapAdjustment));
 		Instruction heapBaseInstr_2 = listing.getInstructionAt(mainRefAddr.add(__heapbase_off + noheapAdjustment).add(4));
 		Instruction sbssInstr1 = listing.getInstructionAt(startFunc);
 		Instruction sbssInstr2 = listing.getInstructionAt(startFunc.add(4));
 		
+		// For raw ROMs, these patterns may not exist - gracefully skip compiler segment creation
 		if (heapBaseInstr_1 == null || heapBaseInstr_2 == null ||
 				sbssInstr1 == null || sbssInstr2 == null) {
+			log.appendMsg("Compiler segments not found - raw ROM or non-standard structure, skipping");
 			return;
 		}
 		
@@ -754,35 +1004,83 @@ public class PsxLoader extends AbstractLibrarySupportLoader {
 	private List<AddressRange> createSegments(ByteProvider provider, FlatProgramAPI fpa, MessageLog log) throws IOException, AddressOverflowException {
 		List<AddressRange> res = new ArrayList<>();
 		
-		InputStream codeStream = provider.getInputStream(PsxExe.HEADER_SIZE);
-		
-		long ram_size_1 = psxExe.getRomStart() - ramBase;
-		createSegment(fpa, null, "RAM", ramBase, ram_size_1, true, true, log);
-		res.add(new AddressRangeImpl(fpa.toAddr(ramBase), ram_size_1));
+		// For raw ROMs (no PSX header), start at offset 0, otherwise skip 0x800 header
+		InputStream codeStream;
+		try {
+			if (provider.length() > PsxExe.HEADER_SIZE) {
+				// Try to check if there's a PSX header by reading "PS-X EXE" magic
+				byte[] headerCheck = provider.readBytes(0, 8);
+				if (new String(headerCheck).equals("PS-X EXE")) {
+					codeStream = provider.getInputStream(PsxExe.HEADER_SIZE);
+				} else {
+					// Raw ROM, no header
+					codeStream = provider.getInputStream(0);
+				}
+			} else {
+				// File too small to have header
+				codeStream = provider.getInputStream(0);
+			}
+		} catch (Exception e) {
+			// Fallback: assume raw ROM
+			codeStream = provider.getInputStream(0);
+		}
 		
 		long code_size = psxExe.getRomSize();
 		long code_addr = psxExe.getRomStart();
 		
-		createSegment(fpa, codeStream, "CODE", code_addr, code_size, false, true, log);
-		res.add(new AddressRangeImpl(fpa.toAddr(code_addr), code_size));
-		
-		if (psxExe.getDataAddr() != 0) {
-			createSegment(fpa, null, ".data", psxExe.getDataAddr(), psxExe.getDataSize(), true, false, log);
-			res.add(new AddressRangeImpl(fpa.toAddr(psxExe.getDataAddr()), psxExe.getDataSize()));
+		// Only create RAM segment before ROM if there's space between ramBase and ROM start
+		long ram_size_1 = code_addr - ramBase;
+		if (ram_size_1 > 0) {
+			Address ramStart = fpa.toAddr(ramBase);
+			Address ramEnd = ramStart.add(ram_size_1 - 1);
+			createSegment(fpa, null, "RAM", ramBase, ram_size_1, true, true, log);
+			res.add(new AddressRangeImpl(ramStart, ramEnd));
 		}
 		
-		if (psxExe.getBssAddr() != 0) {
+		Address codeStart = fpa.toAddr(code_addr);
+		Address codeEnd = codeStart.add(code_size - 1);
+		createSegment(fpa, codeStream, "CODE", code_addr, code_size, false, true, log);
+		res.add(new AddressRangeImpl(codeStart, codeEnd));
+		
+		if (psxExe.getDataAddr() != 0 && psxExe.getDataSize() > 0) {
+			Address dataStart = fpa.toAddr(psxExe.getDataAddr());
+			Address dataEnd = dataStart.add(psxExe.getDataSize() - 1);
+			createSegment(fpa, null, ".data", psxExe.getDataAddr(), psxExe.getDataSize(), true, false, log);
+			res.add(new AddressRangeImpl(dataStart, dataEnd));
+		}
+		
+		if (psxExe.getBssAddr() != 0 && psxExe.getBssSize() > 0) {
+			Address bssStart = fpa.toAddr(psxExe.getBssAddr());
+			Address bssEnd = bssStart.add(psxExe.getBssSize() - 1);
 			createSegment(fpa, null, ".bss", psxExe.getBssAddr(), psxExe.getBssSize(), false, false, log);
-			res.add(new AddressRangeImpl(fpa.toAddr(psxExe.getBssAddr()), psxExe.getBssSize()));
+			res.add(new AddressRangeImpl(bssStart, bssEnd));
 		}
 		
 		long code_end = psxExe.getRomEnd();
-		long ram_size_2 = ramBase + RAM_SIZE - code_end;
-		createSegment(fpa, null, "RAM", code_end, ram_size_2, false, true, log);
-		res.add(new AddressRangeImpl(fpa.toAddr(code_end), ram_size_2));
+		// For System 12, code can extend beyond standard RAM_SIZE
+		// Only create RAM segment after ROM if code_end is within standard RAM range
+		long standardRamEnd = ramBase + RAM_SIZE;
+		if (code_end < standardRamEnd) {
+			long ram_size_2 = standardRamEnd - code_end;
+			if (ram_size_2 > 0) {
+				Address ram2Start = fpa.toAddr(code_end);
+				Address ram2End = ram2Start.add(ram_size_2 - 1);
+				createSegment(fpa, null, "RAM", code_end, ram_size_2, false, true, log);
+				res.add(new AddressRangeImpl(ram2Start, ram2End));
+			}
+		} else {
+			// Code extends beyond standard RAM - create additional RAM segment after code if needed
+			// For System 12, this is normal - code can use extended address space
+			log.appendMsg(String.format("Code extends beyond standard RAM (ends at 0x%08X)", code_end));
+		}
 		
 		createSegment(fpa, null, "CACHE", 0x1F800000L, 0x400, true, true, log);
 		createSegment(fpa, null, "UNK1", 0x1F800400L, 0xC00, true, true, log);
+		
+		// Note: Guard memory regions can't easily prevent decompiler warnings for invalid addresses.
+		// The decompiler warnings are informational - they indicate the code is trying to access
+		// invalid memory, which is expected in raw ROMs with corrupted data/immediate values.
+		// These warnings don't prevent decompilation, they just indicate potential issues.
 		
 		addMemCtrl1(fpa, log);
 		addMemCtrl2(fpa, log);
@@ -795,6 +1093,11 @@ public class PsxLoader extends AbstractLibrarySupportLoader {
 		addMdecRegs(fpa, log);
 		addSpuVoices(fpa, log);
 		addSpuCtrlRegs(fpa, log);
+		
+		// Add System 12 specific memory regions if enabled
+		if (system12Mode) {
+			addSystem12Regions(fpa, log);
+		}
 		
 		return res;
 	}
@@ -1091,6 +1394,33 @@ public class PsxLoader extends AbstractLibrarySupportLoader {
 		createNamedWord(fpa, 0x1F801DB8L, "CURR_MAIN_VOL_L", log);
 		createNamedWord(fpa, 0x1F801DBAL, "CURR_MAIN_VOL_R", log);
 		createNamedDword(fpa, 0x1F801DBCL, "SPU_UNKN_1DBC", log);
+	}
+	
+	/**
+	 * Adds System 12 (Namco System 12) specific memory regions.
+	 * System 12 extends PSX with banked ROM access for larger ROM sets.
+	 * 
+	 * Memory regions added:
+	 * - Bank Register (0x1F000000): 16-bit register to select which 2MB bank is visible
+	 * - Banked ROM Window (0x1FA00000-0x1FBFFFFF): 2MB window into 32MB banked ROM space
+	 * - DMA Offset Register (0x1F700000): Used for DMA-based ROM access
+	 */
+	private static void addSystem12Regions(FlatProgramAPI fpa, MessageLog log) {
+		// Bank Register - 16-bit register at 0x1F000000
+		// Controls which 2MB bank (0-15) is visible in the banked ROM window
+		createSegment(fpa, null, "S12_BANK_REG", SYSTEM12_BANK_REGISTER, 2, true, false, log);
+		createNamedWord(fpa, SYSTEM12_BANK_REGISTER, "S12_ROM_BANK", log);
+		
+		// Banked ROM Window - 2MB window at 0x1FA00000-0x1FBFFFFF
+		// This window shows 2MB of the 32MB banked ROM space
+		// The visible bank is controlled by S12_ROM_BANK register
+		// Total of 16 banks: 0x0000000-0x01FFFFF (bank 0), 0x0200000-0x03FFFFF (bank 1), etc.
+		createSegment(fpa, null, "S12_BANKED_ROM", SYSTEM12_BANKED_ROM_WINDOW_START, SYSTEM12_BANKED_ROM_WINDOW_SIZE, false, true, log);
+		
+		// DMA Offset Register - Used for DMA-based ROM access
+		// This register contains an offset used when accessing ROMs via DMA
+		createSegment(fpa, null, "S12_DMA_OFFSET", SYSTEM12_DMA_OFFSET_REGISTER, 4, true, false, log);
+		createNamedDword(fpa, SYSTEM12_DMA_OFFSET_REGISTER, "S12_DMA_ROM_OFFSET", log);
 	}
 	
 	private static void createNamedByte(FlatProgramAPI fpa, long address, String name, MessageLog log) {

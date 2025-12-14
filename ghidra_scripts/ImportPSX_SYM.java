@@ -156,6 +156,10 @@ public class ImportPSX_SYM extends GhidraScript {
 		}
 	}
 
+	// Label interface moved to outer class to allow static nested classes in SYMParser
+	public static interface Label {
+	}
+
 	public final class SYMLexer {
 		public final List<Chunk> chunks = new ArrayList<>();
 
@@ -277,11 +281,11 @@ public class ImportPSX_SYM extends GhidraScript {
 
 		// Tag 0x8C
 		private void parseTagFunctionStart(long address) throws IOException {
-			int fp = reader.readNextUnsignedShort();
-			long fsize = reader.readNextUnsignedInt();
-			int retreg = reader.readNextUnsignedShort();
-			long mask = reader.readNextUnsignedInt();
-			long maskoffs = reader.readNextUnsignedInt();
+			reader.readNextUnsignedShort(); // fp (unused)
+			reader.readNextUnsignedInt(); // fsize (unused)
+			reader.readNextUnsignedShort(); // retreg (unused)
+			reader.readNextUnsignedInt(); // mask (unused)
+			reader.readNextUnsignedInt(); // maskoffs (unused)
 			long line = reader.readNextUnsignedInt();
 			String file = readPascalString();
 			String name = readPascalString();
@@ -291,19 +295,19 @@ public class ImportPSX_SYM extends GhidraScript {
 
 		// Tag 0x8E
 		private void parseTagFunctionEnd(long address) throws IOException {
-			long endLine = reader.readNextUnsignedInt();
+			reader.readNextUnsignedInt(); // endLine (unused)
 
 			chunks.add(new ChunkFunctionEnd(address));
 		}
 
 		// Tag 0x90
 		private void parseTagBlockStart(long address) throws IOException {
-			long startLine = reader.readNextUnsignedInt();
+			reader.readNextUnsignedInt(); // startLine (unused)
 		}
 
 		// Tag 0x92
 		private void parseTagBlockEnd(long address) throws IOException {
-			long endLine = reader.readNextUnsignedInt();
+			reader.readNextUnsignedInt(); // endLine (unused)
 		}
 
 		// Tag 0x94
@@ -338,7 +342,7 @@ public class ImportPSX_SYM extends GhidraScript {
 	}
 
 	public class SYMParser {
-		public static abstract class Type {
+		public abstract class Type {
 			public final ChunkDef definition;
 
 			public Type(ChunkDef definition) {
@@ -346,7 +350,7 @@ public class ImportPSX_SYM extends GhidraScript {
 			}
 		}
 
-		public static class TypeTag extends Type {
+		public class TypeTag extends Type {
 			public final List<ChunkDef> children = new ArrayList<>();
 
 			public TypeTag(ChunkDef definition) {
@@ -354,16 +358,13 @@ public class ImportPSX_SYM extends GhidraScript {
 			}
 		}
 
-		public static class TypeDef extends Type {
+		public class TypeDef extends Type {
 			public TypeDef(ChunkDef definition) {
 				super(definition);
 			}
 		}
 
-		public interface Label {
-		}
-
-		public static class LabelFunction implements Label {
+		public class LabelFunction implements ImportPSX_SYM.Label {
 			public final ChunkDef definition;
 			public ChunkFunctionStart fnStart;
 			public ChunkFunctionEnd fnEnd;
@@ -374,7 +375,7 @@ public class ImportPSX_SYM extends GhidraScript {
 			}
 		}
 
-		public static class LabelData implements Label {
+		public class LabelData implements ImportPSX_SYM.Label {
 			public final Chunk definition;
 
 			public LabelData(Chunk definition) {
@@ -384,7 +385,7 @@ public class ImportPSX_SYM extends GhidraScript {
 
 		public ChunkSLDFilenameSet32 sldFile;
 		public List<Type> types = new ArrayList<>();
-		public Map<Long, Label> namespaceLabels = new TreeMap<>();
+		public Map<Long, ImportPSX_SYM.Label> namespaceLabels = new TreeMap<>();
 
 		private TypeTag currentTag;
 		private LabelFunction currentFunction;
@@ -575,12 +576,12 @@ public class ImportPSX_SYM extends GhidraScript {
 			if (typeDef.definition.tag == null || typeDef.definition.tag.isBlank()) {
 				dataType = getDataTypeFromBasicDefinition(typeDef.definition);
 				registerDataType(new TypedefDataType(new CategoryPath("/MND"), typeDef.definition.name, dataType));
-				writer.println("Defined typedef " + typeDef.definition.name);
+				println("Defined typedef " + typeDef.definition.name);
 			} else {
 				dataType = findDataTypeByName(typeDef.definition.tag, DataType.class);
 				if (dataType != null) {
 					registerDataType(new TypedefDataType(new CategoryPath("/MND"), typeDef.definition.name, dataType));
-					writer.println("Defined typedef " + typeDef.definition.name);
+					println("Defined typedef " + typeDef.definition.name);
 				} else {
 					// Typedef of anonymous tag, instanciate it.
 					dataType = processTypeTag(typeDef.definition.name, findTypeTagByName(typeDef.definition.tag));
@@ -609,7 +610,7 @@ public class ImportPSX_SYM extends GhidraScript {
 					enum_.add(def.name, def.address);
 				}
 
-				writer.println("Defined enum " + name);
+				println("Defined enum " + name);
 				return enum_;
 			} else if (typeTag.definition.clazz == DefinitionClass.STRTAG) {
 				Structure struct = new StructureDataType(new CategoryPath("/MND"), name, 0,
@@ -635,12 +636,12 @@ public class ImportPSX_SYM extends GhidraScript {
 
 				struct.repack();
 				if (struct.getLength() != typeTag.definition.size) {
-					writer.println("Structure " + name + " doesn't match declared size " + typeTag.definition.size);
+					println("Structure " + name + " doesn't match declared size " + typeTag.definition.size);
 				}
 				// Re-register to refresh struct inside DataTypeManager. Not sure why it is
 				// necessary.
 				registerDataType(struct);
-				writer.println("Defined struct " + name);
+				println("Defined struct " + name);
 				return struct;
 			} else if (typeTag.definition.clazz == DefinitionClass.UNTAG) {
 				Union union = new UnionDataType(new CategoryPath("/MND"), name, getProgramDataTypeManager());
@@ -655,9 +656,9 @@ public class ImportPSX_SYM extends GhidraScript {
 
 				union.repack();
 				if (union.getLength() != typeTag.definition.size) {
-					writer.println("Union " + name + " doesn't match declared size " + typeTag.definition.size);
+					println("Union " + name + " doesn't match declared size " + typeTag.definition.size);
 				}
-				writer.println("Defined union " + name);
+				println("Defined union " + name);
 				return union;
 			} else {
 				throw new RuntimeException(
@@ -666,7 +667,7 @@ public class ImportPSX_SYM extends GhidraScript {
 		}
 
 		private void processLabels() {
-			for (Label label : namespaceLabels.values()) {
+			for (ImportPSX_SYM.Label label : namespaceLabels.values()) {
 				if (label instanceof LabelFunction) {
 					processFunction((LabelFunction) label);
 				} else if (label instanceof LabelData) {
@@ -707,7 +708,7 @@ public class ImportPSX_SYM extends GhidraScript {
 				func.replaceParameters(parameters, Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS, true,
 						SourceType.IMPORTED);
 
-				writer.println(String.format("0x%08x> Processed function %s", labelFunction.definition.address, name));
+				println(String.format("0x%08x> Processed function %s", labelFunction.definition.address, name));
 			} catch (Exception ex) {
 				throw new RuntimeException(ex);
 			}
@@ -722,7 +723,7 @@ public class ImportPSX_SYM extends GhidraScript {
 				try {
 					symbolTable.createLabel(start, sym.name, SourceType.IMPORTED);
 
-					writer.println(String.format("0x%08x> Processed label %s", labelData.definition.address, sym.name));
+					println(String.format("0x%08x> Processed label %s", labelData.definition.address, sym.name));
 				} catch (Exception ex) {
 					throw new RuntimeException(ex);
 				}
@@ -735,7 +736,7 @@ public class ImportPSX_SYM extends GhidraScript {
 					listing.createData(start, dataType);
 					symbolTable.createLabel(start, def.name, SourceType.IMPORTED);
 
-					writer.println(String.format("0x%08x> Processed data %s", labelData.definition.address, def.name));
+					println(String.format("0x%08x> Processed data %s", labelData.definition.address, def.name));
 				} catch (Exception ex) {
 					throw new RuntimeException(ex);
 				}
@@ -767,17 +768,17 @@ public class ImportPSX_SYM extends GhidraScript {
 
 		File file = askFile("Please specify a SYM file to import", "Import");
 
-		writer.println("Lexing SYM file...");
+		println("Lexing SYM file...");
 		symLexer = new SYMLexer();
 		symLexer.processFile(file);
-		writer.println("Finished lexing SYM file.");
+		println("Finished lexing SYM file.");
 
-		writer.println("Parsing SYM file...");
+		println("Parsing SYM file...");
 		symParser = new SYMParser();
 		for (Chunk chunk : symLexer.chunks) {
 			symParser.processChunk(chunk);
 		}
-		writer.println("Finished parsing SYM file.");
+		println("Finished parsing SYM file.");
 
 		String filename;
 		if (symParser.sldFile == null || symParser.sldFile.filename.isEmpty()) {
@@ -787,7 +788,7 @@ public class ImportPSX_SYM extends GhidraScript {
 			filename = symParser.sldFile.filename;
 		}
 
-		writer.println("Importing SYM file (" + filename + ")...");
+		println("Importing SYM file (" + filename + ")...");
 		symParser.importToProgram();
 	}
 

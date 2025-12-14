@@ -29,16 +29,31 @@ public class PsxExe implements StructConverter {
 	private static final long SP_BASE_OFF = 0x30;
 	private static final long SP_OFFSET_OFF = 0x34;
 	
-	private long initPc = 0, initGp = 0;
-	private long romAddr = 0, romSize = 0;
-	private long dataAddr = 0, dataSize = 0;
-	private long bssAddr = 0, bssSize = 0;
-	private long spBase = 0, spOff = 0;
+	protected long initPc = 0, initGp = 0;
+	protected long romAddr = 0, romSize = 0;
+	protected long dataAddr = 0, dataSize = 0;
+	protected long bssAddr = 0, bssSize = 0;
+	protected long spBase = 0, spOff = 0;
 	
-	private boolean parsed = false;
+	protected boolean parsed = false;
 	
 	public PsxExe(BinaryReader reader) throws IOException {
 		Parse(reader);
+	}
+	
+	// Constructor for synthetic PSX EXE (raw ROMs)
+	public PsxExe(long initPc, long initGp, long romAddr, long romSize) {
+		this.initPc = initPc;
+		this.initGp = initGp;
+		this.romAddr = romAddr;
+		this.romSize = romSize;
+		this.dataAddr = 0;
+		this.dataSize = 0;
+		this.bssAddr = 0;
+		this.bssSize = 0;
+		this.spBase = 0;
+		this.spOff = 0;
+		this.parsed = true;
 	}
 	
 	private void Parse(BinaryReader reader) throws IOException {

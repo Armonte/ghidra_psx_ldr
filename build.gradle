@@ -31,3 +31,7 @@ else {
 	throw new GradleException("GHIDRA_INSTALL_DIR is not defined!")
 }
 //----------------------END "DO NOT MODIFY" SECTION-------------------------------
+
+// Note: Data files in data/ directory are automatically included by Ghidra's buildExtension.gradle
+// Make sure git submodules are initialized before building:
+//   git submodule update --init --recursive

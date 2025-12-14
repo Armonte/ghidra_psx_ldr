@@ -1,9 +1,5 @@
 package psyq;
 
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -16,7 +12,6 @@ import ghidra.app.decompiler.DecompileResults;
 import ghidra.program.database.ProgramDB;
 import ghidra.program.database.code.CodeManager;
 import ghidra.program.model.address.Address;
-import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.CommentType;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionManager;
@@ -135,7 +130,16 @@ public class LibgpuMacroDetector {
 			}
 
 			DecompileResults decompResults = ifc.decompileFunction(function, 30, null);
+			
+			// Skip functions that failed to decompile
+			// This can happen with malformed functions, corrupted code, or decompiler failures
+			// Common causes: function boundary issues, invalid control flow, or decompiler crashes
+			if (decompResults == null || decompResults.getHighFunction() == null) {
+				continue;
+			}
+			
 			HighFunction highFunction = decompResults.getHighFunction();
+			
 			Iterator<PcodeOpAST> ast = highFunction.getPcodeOps();
 			ArrayList<PcodeOpAST> PcodeOps = new ArrayList<PcodeOpAST>();
 			while (ast.hasNext()) {
@@ -199,14 +203,17 @@ public class LibgpuMacroDetector {
 								&& value.getInput(0).isRegister()
 								&& value.getInput(1).getOffset() == 0xffffff) {
 
-							long register2 = value.getInput(0).getOffset();
-							value = PcodeOps.get(i + 2);
-							if (value.getOpcode() == PcodeOp.INT_OR
-									&& value.getInput(0).getOffset() == register1
-									&& value.getInput(1).getOffset() == register2) {
+							// Check bounds before accessing i + 2
+							if (i + 2 < PcodeOps.size()) {
+								long register2 = value.getInput(0).getOffset();
+								value = PcodeOps.get(i + 2);
+								if (value.getOpcode() == PcodeOp.INT_OR
+										&& value.getInput(0).getOffset() == register1
+										&& value.getInput(1).getOffset() == register2) {
 
-								SetComment(value, "Probable PsyQ macro: addPrim().", codeManager);
-								logLines.add(value.getSeqnum().getTarget().toString() + ": addPrim()");
+									SetComment(value, "Probable PsyQ macro: addPrim().", codeManager);
+									logLines.add(value.getSeqnum().getTarget().toString() + ": addPrim()");
+								}
 							}
 						} else if (offset == 0xffffffL
 								&& value.getOpcode() == PcodeOp.INT_OR
@@ -228,8 +235,15 @@ public class LibgpuMacroDetector {
 						&& value.getInput(1).getOffset() == 0x4) {
 
 					// Sometimes there is a CAST between the right shift and the bitwise and.
-					value = (PcodeOps.get(i + 1).getOpcode() == PcodeOp.CAST) ? PcodeOps.get(i + 2)
-							: PcodeOps.get(i + 1);
+					// Check bounds before accessing
+					if (i + 2 < PcodeOps.size()) {
+						value = (PcodeOps.get(i + 1).getOpcode() == PcodeOp.CAST) ? PcodeOps.get(i + 2)
+								: PcodeOps.get(i + 1);
+					} else if (i + 1 < PcodeOps.size()) {
+						value = PcodeOps.get(i + 1);
+					} else {
+						continue; // Not enough ops for this pattern
+					}
 
 					if (value.getOpcode() == PcodeOp.INT_AND
 							&& value.getInput(1).getOffset() == 0x3f) {
