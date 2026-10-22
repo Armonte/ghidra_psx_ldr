@@ -73,3 +73,5 @@ The loader should:
 2. **Clear data in regions that look like code** before analysis
 3. **Post-process after analysis** to find missed functions (addresses referenced by calls but not marked as functions)
 
+
+

@@ -1143,7 +1143,9 @@ public class PsxLoader extends AbstractLibrarySupportLoader {
 			program.getMemory().removeBlock(gteMacBlock, TaskMonitor.DUMMY);
 		}
 		
-		createUnitializedSegment(program, "GTEMAC", start, macroses.size() * 4, false, true, log);
+		// GTEMAC is data (hardware registers), not executable code
+		// Marking as non-executable prevents Ghidra from analyzing it as code
+		createUnitializedSegment(program, "GTEMAC", start, macroses.size() * 4, false, false, log);
 		
 		Pattern pat = Pattern.compile("^.+?\\[(\\d+)\\]$");
 		
